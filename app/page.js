@@ -420,6 +420,7 @@ export default function Home() {
             <div className="flex items-center gap-4">
               <a href="/terms" className="text-xs text-[#383838] hover:text-[#888] transition-colors no-underline">Terms</a>
               <a href="/privacy" className="text-xs text-[#383838] hover:text-[#888] transition-colors no-underline">Privacy</a>
+              <a href="/contact" className="text-xs text-[#383838] hover:text-[#888] transition-colors no-underline">Contact</a>
               <span className="text-xs text-[#383838] font-mono">
                 {new Date().getFullYear()}
               </span>

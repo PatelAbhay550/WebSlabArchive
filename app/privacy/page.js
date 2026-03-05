@@ -105,8 +105,8 @@ export default function PrivacyPolicy() {
             <h2 className="text-[#e8e8e8] text-base font-semibold mb-3">8. Contact</h2>
             <p>
               If you have questions about this policy or wish to exercise your data rights,
-              please open an issue on our GitHub repository or contact us through the
-              information provided on our website.
+              please visit our <a href="/contact" className="text-[#e8e8e8] underline hover:text-white transition-colors">Contact page</a> or
+              email us at <a href="mailto:patelabhay550@gmail.com" className="text-[#e8e8e8] underline hover:text-white transition-colors font-mono">patelabhay550@gmail.com</a>.
             </p>
           </section>
         </div>
@@ -118,6 +118,7 @@ export default function PrivacyPolicy() {
           <div className="flex items-center gap-4">
             <a href="/terms" className="text-xs text-[#383838] hover:text-[#888] transition-colors no-underline">Terms</a>
             <a href="/privacy" className="text-xs text-[#383838] hover:text-[#888] transition-colors no-underline">Privacy</a>
+            <a href="/contact" className="text-xs text-[#383838] hover:text-[#888] transition-colors no-underline">Contact</a>
           </div>
         </div>
       </footer>
