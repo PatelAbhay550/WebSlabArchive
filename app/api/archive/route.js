@@ -2,8 +2,12 @@ import { auth } from "@/lib/auth";
 import { getDb, initDb } from "@/lib/db";
 import { cacheInvalidate } from "@/lib/cache";
 import { nanoid } from "nanoid";
-import puppeteer from "puppeteer-core";
+import puppeteerExtra from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import chromium from "@sparticuz/chromium";
+
+// Apply stealth plugin to hide automation signals from Cloudflare
+puppeteerExtra.use(StealthPlugin());
 
 // Increase max execution time for Vercel serverless
 export const maxDuration = 60;
@@ -356,60 +360,110 @@ async function fetchPage(url) {
 }
 
 /**
- * Launch a headless Chromium browser to fetch a page.
- * This can solve JS challenges / Cloudflare basic protection.
+ * Launch a stealth headless Chromium browser to fetch a page.
+ * Uses puppeteer-extra-plugin-stealth to hide automation signals
+ * so Cloudflare and similar bot protections are bypassed.
  */
 async function fetchWithBrowser(url) {
   let browser = null;
   try {
-    browser = await puppeteer.launch({
-      args: chromium.args,
+    browser = await puppeteerExtra.launch({
+      args: [
+        ...chromium.args,
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled",
+      ],
       defaultViewport: { width: 1280, height: 800 },
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
+      ignoreHTTPSErrors: true,
     });
 
     const page = await browser.newPage();
+
+    // Set realistic browser fingerprint
     await page.setUserAgent(USER_AGENTS[0]);
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    });
+
+    // Override navigator.webdriver to hide automation
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+      // Fake plugins
+      Object.defineProperty(navigator, "plugins", {
+        get: () => [1, 2, 3, 4, 5],
+      });
+      // Fake languages
+      Object.defineProperty(navigator, "languages", {
+        get: () => ["en-US", "en"],
+      });
+      // Pass Chrome-specific checks
+      window.chrome = { runtime: {} };
+    });
 
     // Navigate and wait for network to settle
     await page.goto(url, {
       waitUntil: "networkidle2",
-      timeout: 30000,
+      timeout: 35000,
     });
 
-    // Wait a bit for any JS challenges to resolve
-    await new Promise((r) => setTimeout(r, 3000));
+    // Check if stuck on a Cloudflare challenge
+    const isChallenge = await page.evaluate(() => {
+      return (
+        document.title.includes("Just a moment") ||
+        document.title.includes("Cloudflare") ||
+        !!document.querySelector("#challenge-running") ||
+        !!document.querySelector("#challenge-stage") ||
+        !!document.querySelector(".cf-challenge")
+      );
+    });
 
-    // Get the fully rendered HTML
-    const html = await page.content();
-
-    // Check if we're still on a challenge page
-    if (
-      html.includes("Performing security verification") ||
-      html.includes("cf-challenge") ||
-      html.includes("challenge-platform")
-    ) {
-      // Wait longer for challenge to resolve
-      await new Promise((r) => setTimeout(r, 8000));
-      const retryHtml = await page.content();
-      await browser.close();
-      browser = null;
-
-      if (
-        retryHtml.includes("Performing security verification") ||
-        retryHtml.includes("cf-challenge")
-      ) {
-        return null; // Challenge didn't resolve
+    if (isChallenge) {
+      console.log("Cloudflare challenge detected, waiting for resolution...");
+      // Wait for challenge to auto-resolve (stealth plugin helps here)
+      try {
+        await page.waitForFunction(
+          () => {
+            return (
+              !document.title.includes("Just a moment") &&
+              !document.title.includes("Cloudflare") &&
+              !document.querySelector("#challenge-running") &&
+              !document.querySelector("#challenge-stage")
+            );
+          },
+          { timeout: 20000 }
+        );
+        // Extra wait for page content to load after challenge
+        await new Promise((r) => setTimeout(r, 2000));
+      } catch {
+        // Challenge didn't resolve in time
+        await browser.close();
+        browser = null;
+        return null;
       }
-      return retryHtml;
+    } else {
+      // Small wait for dynamic content
+      await new Promise((r) => setTimeout(r, 1500));
     }
 
+    const html = await page.content();
     await browser.close();
     browser = null;
+
+    // Final sanity check — make sure we didn't capture a challenge page
+    if (
+      html.includes("Performing security verification") ||
+      html.includes("cf-challenge-running")
+    ) {
+      return null;
+    }
+
     return html;
   } catch (e) {
-    console.error("Browser fetch error:", e.message);
+    console.error("Stealth browser fetch error:", e.message);
     return null;
   } finally {
     if (browser) {
