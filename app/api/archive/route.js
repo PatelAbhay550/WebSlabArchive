@@ -35,8 +35,14 @@ async function getFreeIndianProxies() {
   }
 
   const sources = [
+    // HTTP proxies
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=IN&ssl=all&anonymity=all",
+    // SOCKS4 proxies
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=10000&country=IN&ssl=all&anonymity=all",
+    // SOCKS5 proxies
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=IN&ssl=all&anonymity=all",
+    // GeoNode free list
+    "https://proxylist.geonode.com/api/proxy-list?limit=50&page=1&country=IN&protocol=http%2Chttps%2Csocks4%2Csocks5&speed=fast",
   ];
 
   const allProxies = [];
@@ -44,12 +50,36 @@ async function getFreeIndianProxies() {
     try {
       const res = await fetch(src, { signal: AbortSignal.timeout(8000) });
       if (res.ok) {
-        const text = await res.text();
-        const list = text
-          .split(/\r?\n/)
-          .map((l) => l.trim())
-          .filter((l) => /^\d+\.\d+\.\d+\.\d+:\d+$/.test(l));
-        allProxies.push(...list);
+        const contentType = res.headers.get("content-type") || "";
+
+        if (contentType.includes("application/json")) {
+          // GeoNode returns JSON
+          const json = await res.json();
+          const data = json.data || json;
+          if (Array.isArray(data)) {
+            for (const p of data) {
+              if (p.ip && p.port) {
+                const proto = (p.protocols?.[0] || "http").toLowerCase();
+                allProxies.push({ addr: `${p.ip}:${p.port}`, proto });
+              }
+            }
+          }
+        } else {
+          // ProxyScrape returns plain text
+          const text = await res.text();
+          // Determine protocol from the source URL
+          let proto = "http";
+          if (src.includes("protocol=socks5")) proto = "socks5";
+          else if (src.includes("protocol=socks4")) proto = "socks4";
+
+          const list = text
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter((l) => /^\d+\.\d+\.\d+\.\d+:\d+$/.test(l));
+          for (const addr of list) {
+            allProxies.push({ addr, proto });
+          }
+        }
       }
     } catch {
       // continue to next source
@@ -358,6 +388,34 @@ async function fetchPage(url) {
   if (indiaRestricted) {
     console.log(`India-restricted domain: ${new URL(url).hostname}`);
 
+    // Try direct fetch first — might work if site doesn't strictly geo-block
+    for (let i = 0; i < 2; i++) {
+      try {
+        const res = await fetch(url, {
+          headers: browserHeaders(url, i),
+          redirect: "follow",
+          signal: AbortSignal.timeout(10000),
+        });
+        if (res.ok) {
+          const ct = res.headers.get("content-type") || "";
+          if (ct.includes("text/html")) return res;
+        }
+      } catch { /* fall through */ }
+    }
+
+    // Try headless browser without proxy (Vercel might route through an Indian edge)
+    try {
+      const html = await fetchWithBrowser(url, null, 20000);
+      if (html) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+          text: async () => html,
+        };
+      }
+    } catch { /* fall through */ }
+
     // Try Wayback Machine (preserves original content faithfully)
     try {
       const wbUrl = `https://web.archive.org/web/2/${url}`;
@@ -369,15 +427,19 @@ async function fetchPage(url) {
       if (res.ok) return res;
     } catch { /* fall through */ }
 
-    // Headless browser with Indian proxy — try up to 3 proxies
+    // Headless browser with Indian proxy — try up to 5 proxies
     const proxiesToTry = INDIAN_PROXY
       ? [INDIAN_PROXY]
-      : (await getFreeIndianProxies()).slice(0, 3).map((p) => `http://${p}`);
+      : (await getFreeIndianProxies()).slice(0, 5).map((p) =>
+          p.proto === "socks5" ? `socks5://${p.addr}`
+          : p.proto === "socks4" ? `socks4://${p.addr}`
+          : `http://${p.addr}`
+        );
 
     for (const proxy of proxiesToTry) {
       try {
         console.log(`Trying Indian proxy: ${proxy}`);
-        const html = await fetchWithBrowser(url, proxy);
+        const html = await fetchWithBrowser(url, proxy, 15000);
         if (html) {
           return {
             ok: true,
@@ -391,19 +453,7 @@ async function fetchPage(url) {
       }
     }
 
-    // Last resort: try without proxy (in case site is accessible)
-    try {
-      const html = await fetchWithBrowser(url);
-      if (html) {
-        return {
-          ok: true,
-          status: 200,
-          headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
-          text: async () => html,
-        };
-      }
-    } catch { /* fall through */ }
-
+    // Last resort: try without proxy
     return { ok: false, status: 403, fallback: true };
   }
 
@@ -487,7 +537,7 @@ async function fetchPage(url) {
  * Uses puppeteer-extra-plugin-stealth to hide automation signals
  * so Cloudflare and similar bot protections are bypassed.
  */
-async function fetchWithBrowser(url, proxyUrl = null) {
+async function fetchWithBrowser(url, proxyUrl = null, navTimeout = 35000) {
   let browser = null;
   try {
     const launchArgs = [
@@ -545,7 +595,7 @@ async function fetchWithBrowser(url, proxyUrl = null) {
     // Navigate and wait for network to settle
     await page.goto(url, {
       waitUntil: "networkidle2",
-      timeout: 35000,
+      timeout: navTimeout,
     });
 
     // Check if stuck on a Cloudflare challenge
