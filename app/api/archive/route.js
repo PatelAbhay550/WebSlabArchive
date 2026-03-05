@@ -8,96 +8,13 @@ import chromium from "@sparticuz/chromium";
 export const maxDuration = 60;
 
 /* ------- Geo-restricted domains (need Indian IP) ------- */
+// The archive function runs in Vercel's bom1 (Mumbai) region,
+// so direct fetches already come from an Indian IP.
+// These domains get extra fallback logic if direct fetch fails.
 const INDIA_RESTRICTED_DOMAINS = [
   "sscexams.cbexams.com",
   "cbexams.com",
 ];
-
-// Set INDIAN_PROXY_URL in .env, e.g. http://user:pass@in-proxy.example.com:8080
-// If not set, free proxies will be fetched automatically from ProxyScrape.
-const INDIAN_PROXY = process.env.INDIAN_PROXY_URL || "";
-
-// Cache of free Indian proxies (refreshed every 5 minutes)
-let _freeProxyCache = { proxies: [], fetchedAt: 0 };
-const PROXY_CACHE_TTL = 5 * 60 * 1000; // 5 min
-
-/**
- * Fetch a list of free Indian HTTP proxies from ProxyScrape.
- * Returns an array of "ip:port" strings.
- */
-async function getFreeIndianProxies() {
-  const now = Date.now();
-  if (
-    _freeProxyCache.proxies.length > 0 &&
-    now - _freeProxyCache.fetchedAt < PROXY_CACHE_TTL
-  ) {
-    return _freeProxyCache.proxies;
-  }
-
-  const sources = [
-    // HTTP proxies
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=IN&ssl=all&anonymity=all",
-    // SOCKS4 proxies
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=10000&country=IN&ssl=all&anonymity=all",
-    // SOCKS5 proxies
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=IN&ssl=all&anonymity=all",
-    // GeoNode free list
-    "https://proxylist.geonode.com/api/proxy-list?limit=50&page=1&country=IN&protocol=http%2Chttps%2Csocks4%2Csocks5&speed=fast",
-  ];
-
-  const allProxies = [];
-  for (const src of sources) {
-    try {
-      const res = await fetch(src, { signal: AbortSignal.timeout(8000) });
-      if (res.ok) {
-        const contentType = res.headers.get("content-type") || "";
-
-        if (contentType.includes("application/json")) {
-          // GeoNode returns JSON
-          const json = await res.json();
-          const data = json.data || json;
-          if (Array.isArray(data)) {
-            for (const p of data) {
-              if (p.ip && p.port) {
-                const proto = (p.protocols?.[0] || "http").toLowerCase();
-                allProxies.push({ addr: `${p.ip}:${p.port}`, proto });
-              }
-            }
-          }
-        } else {
-          // ProxyScrape returns plain text
-          const text = await res.text();
-          // Determine protocol from the source URL
-          let proto = "http";
-          if (src.includes("protocol=socks5")) proto = "socks5";
-          else if (src.includes("protocol=socks4")) proto = "socks4";
-
-          const list = text
-            .split(/\r?\n/)
-            .map((l) => l.trim())
-            .filter((l) => /^\d+\.\d+\.\d+\.\d+:\d+$/.test(l));
-          for (const addr of list) {
-            allProxies.push({ addr, proto });
-          }
-        }
-      }
-    } catch {
-      // continue to next source
-    }
-  }
-
-  if (allProxies.length > 0) {
-    // Shuffle so we don't always hit the same proxy
-    for (let i = allProxies.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [allProxies[i], allProxies[j]] = [allProxies[j], allProxies[i]];
-    }
-    _freeProxyCache = { proxies: allProxies, fetchedAt: now };
-    console.log(`Fetched ${allProxies.length} free Indian proxies`);
-  }
-
-  return allProxies;
-}
 
 function needsIndianProxy(url) {
   try {
@@ -107,6 +24,30 @@ function needsIndianProxy(url) {
     );
   } catch {
     return false;
+  }
+}
+
+/**
+ * Fetch a URL via Jina Reader API (free, no key needed, handles JS rendering).
+ * Returns HTML string or null.
+ */
+async function fetchViaJina(url) {
+  try {
+    const res = await fetch(`https://r.jina.ai/${url}`, {
+      headers: {
+        "Accept": "text/html",
+        "X-Respond-With": "html",
+        "X-No-Cache": "true",
+      },
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    // Jina returns minimal content for blocked pages
+    if (html.length < 500) return null;
+    return html;
+  } catch {
+    return null;
   }
 }
 
@@ -383,30 +324,37 @@ async function fetchPage(url) {
   let lastError = null;
   const indiaRestricted = needsIndianProxy(url);
 
-  // For India-restricted domains, direct fetches from non-Indian IPs always 403.
-  // Skip straight to cache/proxy fallbacks, then headless browser with Indian proxy.
+  // For India-restricted domains, the function already runs from Mumbai (bom1).
+  // Direct fetch should work. Add extra fallbacks if it doesn't.
   if (indiaRestricted) {
     console.log(`India-restricted domain: ${new URL(url).hostname}`);
 
-    // Try direct fetch first — might work if site doesn't strictly geo-block
+    // Attempt 1-2: direct fetch (from Mumbai region = Indian IP)
     for (let i = 0; i < 2; i++) {
       try {
         const res = await fetch(url, {
           headers: browserHeaders(url, i),
           redirect: "follow",
-          signal: AbortSignal.timeout(10000),
+          signal: AbortSignal.timeout(15000),
         });
         if (res.ok) {
           const ct = res.headers.get("content-type") || "";
-          if (ct.includes("text/html")) return res;
+          if (ct.includes("text/html")) {
+            console.log("Direct fetch from Mumbai succeeded");
+            return res;
+          }
         }
-      } catch { /* fall through */ }
+        lastError = res.status;
+      } catch (e) {
+        lastError = e.message;
+      }
     }
 
-    // Try headless browser without proxy (Vercel might route through an Indian edge)
+    // Attempt 3: headless browser (also from Mumbai)
     try {
-      const html = await fetchWithBrowser(url, null, 20000);
+      const html = await fetchWithBrowser(url);
       if (html) {
+        console.log("Headless browser from Mumbai succeeded");
         return {
           ok: true,
           status: 200,
@@ -416,7 +364,21 @@ async function fetchPage(url) {
       }
     } catch { /* fall through */ }
 
-    // Try Wayback Machine (preserves original content faithfully)
+    // Attempt 4: Jina Reader API (free scraping service with JS rendering)
+    try {
+      const html = await fetchViaJina(url);
+      if (html) {
+        console.log("Jina Reader API succeeded");
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+          text: async () => html,
+        };
+      }
+    } catch { /* fall through */ }
+
+    // Attempt 5: Wayback Machine
     try {
       const wbUrl = `https://web.archive.org/web/2/${url}`;
       const res = await fetch(wbUrl, {
@@ -427,34 +389,7 @@ async function fetchPage(url) {
       if (res.ok) return res;
     } catch { /* fall through */ }
 
-    // Headless browser with Indian proxy — try up to 5 proxies
-    const proxiesToTry = INDIAN_PROXY
-      ? [INDIAN_PROXY]
-      : (await getFreeIndianProxies()).slice(0, 5).map((p) =>
-          p.proto === "socks5" ? `socks5://${p.addr}`
-          : p.proto === "socks4" ? `socks4://${p.addr}`
-          : `http://${p.addr}`
-        );
-
-    for (const proxy of proxiesToTry) {
-      try {
-        console.log(`Trying Indian proxy: ${proxy}`);
-        const html = await fetchWithBrowser(url, proxy, 15000);
-        if (html) {
-          return {
-            ok: true,
-            status: 200,
-            headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
-            text: async () => html,
-          };
-        }
-      } catch (e) {
-        console.error(`Proxy ${proxy} failed:`, e.message);
-      }
-    }
-
-    // Last resort: try without proxy
-    return { ok: false, status: 403, fallback: true };
+    return { ok: false, status: lastError || 403, fallback: true };
   }
 
   // Attempt 1-3: direct fetch with rotating UAs
