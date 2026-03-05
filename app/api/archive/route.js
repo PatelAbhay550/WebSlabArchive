@@ -52,8 +52,8 @@ async function fetchViaJina(url) {
 }
 
 /* ------- Size limits for image inlining ------- */
-const MAX_SINGLE_IMAGE = 2 * 1024 * 1024; // 2 MB per image
-const MAX_TOTAL_INLINE = 12 * 1024 * 1024; // 12 MB total budget
+const MAX_SINGLE_IMAGE = 3 * 1024 * 1024; // 3 MB per image
+const MAX_TOTAL_INLINE = 20 * 1024 * 1024; // 20 MB total budget
 
 /**
  * Resolve a potentially relative URL to an absolute URL.
@@ -83,18 +83,34 @@ async function fetchAsDataUri(url) {
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
       },
       redirect: "follow",
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(12000),
     });
     if (!res.ok) return null;
 
-    const ct = res.headers.get("content-type") || "image/png";
+    const ct = res.headers.get("content-type") || "";
     const buf = await res.arrayBuffer();
 
     if (buf.byteLength > MAX_SINGLE_IMAGE) return null; // too large
-    if (!ct.startsWith("image/") && !ct.startsWith("font/")) return null;
+    if (buf.byteLength === 0) return null;
+
+    // Detect MIME from content-type or guess from URL extension
+    let mime = ct.split(";")[0].trim().toLowerCase();
+    if (!mime || mime === "application/octet-stream" || mime === "text/plain") {
+      // Guess from extension
+      const ext = url.match(/\.(png|jpe?g|gif|webp|avif|svg|ico|bmp)(\?|$)/i);
+      if (ext) {
+        const e = ext[1].toLowerCase();
+        mime = e === "jpg" ? "image/jpeg" : e === "svg" ? "image/svg+xml" : `image/${e}`;
+      } else {
+        mime = "image/png"; // safe default
+      }
+    }
+
+    // Accept images and fonts, also accept application/octet-stream (some servers misconfigure)
+    if (!mime.startsWith("image/") && !mime.startsWith("font/")) return null;
 
     const b64 = Buffer.from(buf).toString("base64");
-    return { dataUri: `data:${ct};base64,${b64}`, size: buf.byteLength };
+    return { dataUri: `data:${mime};base64,${b64}`, size: buf.byteLength };
   } catch {
     return null;
   }
@@ -571,6 +587,59 @@ async function fetchWithBrowser(url, proxyUrl = null, navTimeout = 35000) {
       // Small wait for dynamic content
       await new Promise((r) => setTimeout(r, 1500));
     }
+
+    // Inline all images as base64 data URIs inside the browser context.
+    // This uses the browser's own cookies/session, so geo-restricted images
+    // (like cbexams answer keys) are preserved even if the site later removes them.
+    await page.evaluate(async () => {
+      const MAX_SINGLE = 3 * 1024 * 1024; // 3 MB per image
+      const MAX_TOTAL = 20 * 1024 * 1024; // 20 MB total
+      let totalSize = 0;
+
+      async function toDataUri(src) {
+        try {
+          const res = await fetch(src, { credentials: "include" });
+          if (!res.ok) return null;
+          const blob = await res.blob();
+          if (blob.size > MAX_SINGLE || blob.size === 0) return null;
+          const mime = blob.type || "image/png";
+          if (!mime.startsWith("image/")) return null;
+          return await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve({ uri: reader.result, size: blob.size });
+            reader.onerror = () => resolve(null);
+            reader.readAsDataURL(blob);
+          });
+        } catch {
+          return null;
+        }
+      }
+
+      const imgs = document.querySelectorAll("img[src]");
+      // Process in batches of 5
+      const arr = Array.from(imgs).filter(
+        (img) => img.src && !img.src.startsWith("data:")
+      );
+      for (let i = 0; i < arr.length; i += 5) {
+        if (totalSize >= MAX_TOTAL) break;
+        const batch = arr.slice(i, i + 5);
+        const results = await Promise.allSettled(
+          batch.map((img) => toDataUri(img.src))
+        );
+        for (let j = 0; j < results.length; j++) {
+          const r = results[j];
+          if (r.status === "fulfilled" && r.value) {
+            if (totalSize + r.value.size <= MAX_TOTAL) {
+              batch[j].setAttribute("src", r.value.uri);
+              totalSize += r.value.size;
+            }
+          }
+        }
+      }
+
+      // Also inline CSS background images in <style> blocks
+      // (less critical, skip for performance)
+    });
 
     const html = await page.content();
     await browser.close();
