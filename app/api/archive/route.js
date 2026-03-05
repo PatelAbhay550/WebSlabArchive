@@ -2,6 +2,11 @@ import { auth } from "@/lib/auth";
 import { getDb, initDb } from "@/lib/db";
 import { cacheInvalidate } from "@/lib/cache";
 import { nanoid } from "nanoid";
+import puppeteer from "puppeteer-core";
+import chromium from "@sparticuz/chromium";
+
+// Increase max execution time for Vercel serverless
+export const maxDuration = 60;
 
 /* ------- Size limits for image inlining ------- */
 const MAX_SINGLE_IMAGE = 2 * 1024 * 1024; // 2 MB per image
@@ -221,9 +226,8 @@ function extractMeta(html, pageUrl) {
 
   if (thumbnail) thumbnail = toAbsolute(thumbnail, pageUrl);
 
-  if (!thumbnail) {
-    thumbnail = `https://image.thum.io/get/width/600/crop/400/noanimate/${pageUrl}`;
-  }
+  // No external thumbnail service — if no image found, leave empty
+  // (thum.io gets blocked by Cloudflare and shows challenge pages)
 
   let description = "";
   const descMatch = html.match(
@@ -332,7 +336,86 @@ async function fetchPage(url) {
     // fall through
   }
 
+  // Attempt 7: Headless browser (handles Cloudflare JS challenges)
+  try {
+    const html = await fetchWithBrowser(url);
+    if (html) {
+      // Wrap the HTML string in a Response-like object
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+        text: async () => html,
+      };
+    }
+  } catch (e) {
+    console.error("Puppeteer fallback error:", e.message);
+  }
+
   return { ok: false, status: lastError || 403, fallback: true };
+}
+
+/**
+ * Launch a headless Chromium browser to fetch a page.
+ * This can solve JS challenges / Cloudflare basic protection.
+ */
+async function fetchWithBrowser(url) {
+  let browser = null;
+  try {
+    browser = await puppeteer.launch({
+      args: chromium.args,
+      defaultViewport: { width: 1280, height: 800 },
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+    });
+
+    const page = await browser.newPage();
+    await page.setUserAgent(USER_AGENTS[0]);
+
+    // Navigate and wait for network to settle
+    await page.goto(url, {
+      waitUntil: "networkidle2",
+      timeout: 30000,
+    });
+
+    // Wait a bit for any JS challenges to resolve
+    await new Promise((r) => setTimeout(r, 3000));
+
+    // Get the fully rendered HTML
+    const html = await page.content();
+
+    // Check if we're still on a challenge page
+    if (
+      html.includes("Performing security verification") ||
+      html.includes("cf-challenge") ||
+      html.includes("challenge-platform")
+    ) {
+      // Wait longer for challenge to resolve
+      await new Promise((r) => setTimeout(r, 8000));
+      const retryHtml = await page.content();
+      await browser.close();
+      browser = null;
+
+      if (
+        retryHtml.includes("Performing security verification") ||
+        retryHtml.includes("cf-challenge")
+      ) {
+        return null; // Challenge didn't resolve
+      }
+      return retryHtml;
+    }
+
+    await browser.close();
+    browser = null;
+    return html;
+  } catch (e) {
+    console.error("Browser fetch error:", e.message);
+    return null;
+  } finally {
+    if (browser) {
+      try { await browser.close(); } catch {}
+    }
+  }
 }
 
 export async function POST(request) {
