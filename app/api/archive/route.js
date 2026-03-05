@@ -31,11 +31,11 @@ async function fetchAsDataUri(url) {
   try {
     const res = await fetch(url, {
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (compatible; WebSlabArchive/1.0; +https://webslabarchive.vercel.app)",
+        ...browserHeaders(url, 0),
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
       },
       redirect: "follow",
-      signal: AbortSignal.timeout(8000), // 8s timeout per image
+      signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) return null;
 
@@ -240,6 +240,101 @@ function extractMeta(html, pageUrl) {
   return { thumbnail, description };
 }
 
+/* ------- Browser-like fetch with retries ------- */
+const USER_AGENTS = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+];
+
+function browserHeaders(url, uaIndex = 0) {
+  return {
+    "User-Agent": USER_AGENTS[uaIndex % USER_AGENTS.length],
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": new URL(url).origin + "/",
+  };
+}
+
+/**
+ * Fetch a URL with browser-like headers.
+ * Retries up to 3 times with different User-Agents.
+ * On final retry, falls back to a Google Cache / web proxy.
+ */
+async function fetchPage(url) {
+  let lastError = null;
+
+  // Attempt 1-3: direct fetch with rotating UAs
+  for (let i = 0; i < 3; i++) {
+    try {
+      const res = await fetch(url, {
+        headers: browserHeaders(url, i),
+        redirect: "follow",
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) return res;
+      lastError = res.status;
+      // If 403/406/451, try next UA; otherwise break
+      if (![403, 406, 429, 451].includes(res.status)) break;
+    } catch (e) {
+      lastError = e.message;
+    }
+  }
+
+  // Attempt 4: use Google webcache as proxy
+  try {
+    const cacheUrl = `https://webcache.googleusercontent.com/search?q=cache:${encodeURIComponent(url)}`;
+    const res = await fetch(cacheUrl, {
+      headers: browserHeaders(cacheUrl, 0),
+      redirect: "follow",
+      signal: AbortSignal.timeout(15000),
+    });
+    if (res.ok) return res;
+  } catch {
+    // fall through
+  }
+
+  // Attempt 5: use archive.org Wayback as read-through proxy
+  try {
+    const wbUrl = `https://web.archive.org/web/2/${url}`;
+    const res = await fetch(wbUrl, {
+      headers: browserHeaders(wbUrl, 1),
+      redirect: "follow",
+      signal: AbortSignal.timeout(15000),
+    });
+    if (res.ok) return res;
+  } catch {
+    // fall through
+  }
+
+  // Attempt 6: 12ft.io proxy (strips paywalls/blocks)
+  try {
+    const proxyUrl = `https://12ft.io/api/proxy?q=${encodeURIComponent(url)}`;
+    const res = await fetch(proxyUrl, {
+      headers: { "User-Agent": USER_AGENTS[0] },
+      redirect: "follow",
+      signal: AbortSignal.timeout(15000),
+    });
+    if (res.ok) return res;
+  } catch {
+    // fall through
+  }
+
+  return { ok: false, status: lastError || 403, fallback: true };
+}
+
 export async function POST(request) {
   try {
     // Require authentication
@@ -272,18 +367,12 @@ export async function POST(request) {
       );
     }
 
-    // Fetch the page
-    const response = await fetch(parsedUrl.href, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (compatible; WebSlabArchive/1.0; +https://webslabarchive.vercel.app)",
-      },
-      redirect: "follow",
-    });
+    // Fetch the page with browser impersonation + fallback proxies
+    const response = await fetchPage(parsedUrl.href);
 
     if (!response.ok) {
       return Response.json(
-        { error: `Failed to fetch URL: HTTP ${response.status}` },
+        { error: `Failed to fetch URL: HTTP ${response.status}. The site may be blocking automated access.` },
         { status: 502 }
       );
     }
