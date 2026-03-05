@@ -358,18 +358,7 @@ async function fetchPage(url) {
   if (indiaRestricted) {
     console.log(`India-restricted domain: ${new URL(url).hostname}`);
 
-    // Try Google Cache (might have a cached copy)
-    try {
-      const cacheUrl = `https://webcache.googleusercontent.com/search?q=cache:${encodeURIComponent(url)}`;
-      const res = await fetch(cacheUrl, {
-        headers: browserHeaders(cacheUrl, 0),
-        redirect: "follow",
-        signal: AbortSignal.timeout(15000),
-      });
-      if (res.ok) return res;
-    } catch { /* fall through */ }
-
-    // Try Wayback Machine
+    // Try Wayback Machine (preserves original content faithfully)
     try {
       const wbUrl = `https://web.archive.org/web/2/${url}`;
       const res = await fetch(wbUrl, {
