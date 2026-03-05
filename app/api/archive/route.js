@@ -7,6 +7,79 @@ import chromium from "@sparticuz/chromium";
 // Increase max execution time for Vercel serverless
 export const maxDuration = 60;
 
+/* ------- Geo-restricted domains (need Indian IP) ------- */
+const INDIA_RESTRICTED_DOMAINS = [
+  "sscexams.cbexams.com",
+  "cbexams.com",
+];
+
+// Set INDIAN_PROXY_URL in .env, e.g. http://user:pass@in-proxy.example.com:8080
+// If not set, free proxies will be fetched automatically from ProxyScrape.
+const INDIAN_PROXY = process.env.INDIAN_PROXY_URL || "";
+
+// Cache of free Indian proxies (refreshed every 5 minutes)
+let _freeProxyCache = { proxies: [], fetchedAt: 0 };
+const PROXY_CACHE_TTL = 5 * 60 * 1000; // 5 min
+
+/**
+ * Fetch a list of free Indian HTTP proxies from ProxyScrape.
+ * Returns an array of "ip:port" strings.
+ */
+async function getFreeIndianProxies() {
+  const now = Date.now();
+  if (
+    _freeProxyCache.proxies.length > 0 &&
+    now - _freeProxyCache.fetchedAt < PROXY_CACHE_TTL
+  ) {
+    return _freeProxyCache.proxies;
+  }
+
+  const sources = [
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=IN&ssl=all&anonymity=all",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=10000&country=IN&ssl=all&anonymity=all",
+  ];
+
+  const allProxies = [];
+  for (const src of sources) {
+    try {
+      const res = await fetch(src, { signal: AbortSignal.timeout(8000) });
+      if (res.ok) {
+        const text = await res.text();
+        const list = text
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter((l) => /^\d+\.\d+\.\d+\.\d+:\d+$/.test(l));
+        allProxies.push(...list);
+      }
+    } catch {
+      // continue to next source
+    }
+  }
+
+  if (allProxies.length > 0) {
+    // Shuffle so we don't always hit the same proxy
+    for (let i = allProxies.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [allProxies[i], allProxies[j]] = [allProxies[j], allProxies[i]];
+    }
+    _freeProxyCache = { proxies: allProxies, fetchedAt: now };
+    console.log(`Fetched ${allProxies.length} free Indian proxies`);
+  }
+
+  return allProxies;
+}
+
+function needsIndianProxy(url) {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    return INDIA_RESTRICTED_DOMAINS.some(
+      (d) => hostname === d || hostname.endsWith("." + d)
+    );
+  } catch {
+    return false;
+  }
+}
+
 /* ------- Size limits for image inlining ------- */
 const MAX_SINGLE_IMAGE = 2 * 1024 * 1024; // 2 MB per image
 const MAX_TOTAL_INLINE = 12 * 1024 * 1024; // 12 MB total budget
@@ -278,6 +351,72 @@ function browserHeaders(url, uaIndex = 0) {
  */
 async function fetchPage(url) {
   let lastError = null;
+  const indiaRestricted = needsIndianProxy(url);
+
+  // For India-restricted domains, direct fetches from non-Indian IPs always 403.
+  // Skip straight to cache/proxy fallbacks, then headless browser with Indian proxy.
+  if (indiaRestricted) {
+    console.log(`India-restricted domain: ${new URL(url).hostname}`);
+
+    // Try Google Cache (might have a cached copy)
+    try {
+      const cacheUrl = `https://webcache.googleusercontent.com/search?q=cache:${encodeURIComponent(url)}`;
+      const res = await fetch(cacheUrl, {
+        headers: browserHeaders(cacheUrl, 0),
+        redirect: "follow",
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) return res;
+    } catch { /* fall through */ }
+
+    // Try Wayback Machine
+    try {
+      const wbUrl = `https://web.archive.org/web/2/${url}`;
+      const res = await fetch(wbUrl, {
+        headers: browserHeaders(wbUrl, 1),
+        redirect: "follow",
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) return res;
+    } catch { /* fall through */ }
+
+    // Headless browser with Indian proxy — try up to 3 proxies
+    const proxiesToTry = INDIAN_PROXY
+      ? [INDIAN_PROXY]
+      : (await getFreeIndianProxies()).slice(0, 3).map((p) => `http://${p}`);
+
+    for (const proxy of proxiesToTry) {
+      try {
+        console.log(`Trying Indian proxy: ${proxy}`);
+        const html = await fetchWithBrowser(url, proxy);
+        if (html) {
+          return {
+            ok: true,
+            status: 200,
+            headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+            text: async () => html,
+          };
+        }
+      } catch (e) {
+        console.error(`Proxy ${proxy} failed:`, e.message);
+      }
+    }
+
+    // Last resort: try without proxy (in case site is accessible)
+    try {
+      const html = await fetchWithBrowser(url);
+      if (html) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+          text: async () => html,
+        };
+      }
+    } catch { /* fall through */ }
+
+    return { ok: false, status: 403, fallback: true };
+  }
 
   // Attempt 1-3: direct fetch with rotating UAs
   for (let i = 0; i < 3; i++) {
@@ -359,7 +498,7 @@ async function fetchPage(url) {
  * Uses puppeteer-extra-plugin-stealth to hide automation signals
  * so Cloudflare and similar bot protections are bypassed.
  */
-async function fetchWithBrowser(url) {
+async function fetchWithBrowser(url, proxyUrl = null) {
   let browser = null;
   try {
     const launchArgs = [
@@ -368,6 +507,12 @@ async function fetchWithBrowser(url) {
       "--disable-setuid-sandbox",
       "--disable-blink-features=AutomationControlled",
     ];
+
+    // Route through proxy when provided
+    if (proxyUrl) {
+      launchArgs.push(`--proxy-server=${proxyUrl}`);
+      console.log("Launching browser with proxy:", proxyUrl);
+    }
 
     // Dynamically import puppeteer-extra + stealth to avoid CJS build errors
     const { default: puppeteerExtra } = await import("puppeteer-extra");
