@@ -2,15 +2,34 @@ import { auth } from "@/lib/auth";
 import { getDb, initDb } from "@/lib/db";
 import { cacheInvalidate } from "@/lib/cache";
 import { nanoid } from "nanoid";
-import puppeteerExtra from "puppeteer-extra";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import chromium from "@sparticuz/chromium";
-
-// Apply stealth plugin to hide automation signals from Cloudflare
-puppeteerExtra.use(StealthPlugin());
 
 // Increase max execution time for Vercel serverless
 export const maxDuration = 60;
+
+/* ------- Geo-restricted domains ------- */
+// Domains that require an Indian IP address to load
+const INDIA_RESTRICTED_DOMAINS = [
+  "sscexams.cbexams.com",
+  "cbexams.com",
+];
+
+// Set INDIAN_PROXY_URL in your env, e.g. http://user:pass@in-proxy:8080
+const INDIAN_PROXY = process.env.INDIAN_PROXY_URL || "";
+
+/**
+ * Check whether a URL belongs to an India-restricted domain.
+ */
+function needsIndianProxy(url) {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    return INDIA_RESTRICTED_DOMAINS.some(
+      (d) => hostname === d || hostname.endsWith("." + d)
+    );
+  } catch {
+    return false;
+  }
+}
 
 /* ------- Size limits for image inlining ------- */
 const MAX_SINGLE_IMAGE = 2 * 1024 * 1024; // 2 MB per image
@@ -283,6 +302,26 @@ function browserHeaders(url, uaIndex = 0) {
  */
 async function fetchPage(url) {
   let lastError = null;
+  const indiaRestricted = needsIndianProxy(url);
+
+  // For India-restricted domains, go straight to headless browser with Indian proxy
+  if (indiaRestricted) {
+    console.log(`India-restricted domain detected: ${new URL(url).hostname}`);
+    try {
+      const html = await fetchWithBrowser(url, true);
+      if (html) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+          text: async () => html,
+        };
+      }
+    } catch (e) {
+      console.error("Indian proxy browser fetch error:", e.message);
+    }
+    return { ok: false, status: 403, fallback: true };
+  }
 
   // Attempt 1-3: direct fetch with rotating UAs
   for (let i = 0; i < 3; i++) {
@@ -364,16 +403,29 @@ async function fetchPage(url) {
  * Uses puppeteer-extra-plugin-stealth to hide automation signals
  * so Cloudflare and similar bot protections are bypassed.
  */
-async function fetchWithBrowser(url) {
+async function fetchWithBrowser(url, useIndianProxy = false) {
   let browser = null;
   try {
+    const launchArgs = [
+      ...chromium.args,
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-blink-features=AutomationControlled",
+    ];
+
+    // Route through Indian proxy when required
+    if (useIndianProxy && INDIAN_PROXY) {
+      launchArgs.push(`--proxy-server=${INDIAN_PROXY}`);
+      console.log("Launching browser with Indian proxy");
+    }
+
+    // Dynamically import puppeteer-extra + stealth to avoid CJS build errors
+    const { default: puppeteerExtra } = await import("puppeteer-extra");
+    const { default: StealthPlugin } = await import("puppeteer-extra-plugin-stealth");
+    puppeteerExtra.use(StealthPlugin());
+
     browser = await puppeteerExtra.launch({
-      args: [
-        ...chromium.args,
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-blink-features=AutomationControlled",
-      ],
+      args: launchArgs,
       defaultViewport: { width: 1280, height: 800 },
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
