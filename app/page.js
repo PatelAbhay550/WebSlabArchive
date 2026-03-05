@@ -407,11 +407,24 @@ export default function Home() {
 
       {/* Footer */}
       <footer className="border-t border-[#282828] py-6">
-        <div className="max-w-6xl mx-auto px-5 flex items-center justify-between">
-          <span className="text-xs text-[#383838]">WebSlab Archive</span>
-          <span className="text-xs text-[#383838] font-mono">
-            {new Date().getFullYear()}
-          </span>
+        <div className="max-w-6xl mx-auto px-5">
+          <p className="text-[10px] text-[#383838] leading-relaxed mb-4 max-w-2xl">
+            By using this service you confirm you have the right to archive the submitted
+            content. WebSlab Archive acts as a technical intermediary and is not responsible
+            for user-archived content. See our{" "}
+            <a href="/terms" className="text-[#555] hover:text-[#888] transition-colors underline">Terms</a>
+            {" "}for details.
+          </p>
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-[#383838]">WebSlab Archive</span>
+            <div className="flex items-center gap-4">
+              <a href="/terms" className="text-xs text-[#383838] hover:text-[#888] transition-colors no-underline">Terms</a>
+              <a href="/privacy" className="text-xs text-[#383838] hover:text-[#888] transition-colors no-underline">Privacy</a>
+              <span className="text-xs text-[#383838] font-mono">
+                {new Date().getFullYear()}
+              </span>
+            </div>
+          </div>
         </div>
       </footer>
     </div>
